@@ -1,0 +1,170 @@
+#!/bin/bash
+
+show_help() {
+    cat << EOF
+Usage: ./suspicious_login_detector.sh -i INPUT_FILE [options]
+
+Purpose:
+  Scan a login log file and report suspicious activity.
+
+Required:
+  -i FILE         Input log file
+
+Options:
+  -u USERNAME     Show only entries for a specific username
+  -p PATTERN      Custom regex pattern to search for
+  -n NUMBER       Minimum failed attempts from same IP to flag (default: 2)
+  -m MODE         Output mode: summary or detailed (default: detailed)
+  -o FILE         Save output to FILE
+  -h              Show this help message
+
+Example:
+  ./suspicious_login_detector.sh -i examples/auth_log_sample.txt
+  ./suspicious_login_detector.sh -i examples/auth_log_sample.txt -u admin -m summary
+  ./suspicious_login_detector.sh -i examples/auth_log_sample.txt -p "Failed password"
+EOF
+}
+
+input_file=""
+username_filter=""
+custom_pattern=""
+min_attempts=2
+mode="detailed"
+output_file=""
+
+while getopts ":i:u:p:n:m:o:h" opt; do
+    case "$opt" in
+        i) input_file="$OPTARG" ;;
+        u) username_filter="$OPTARG" ;;
+        p) custom_pattern="$OPTARG" ;;
+        n) min_attempts="$OPTARG" ;;
+        m) mode="$OPTARG" ;;
+        o) output_file="$OPTARG" ;;
+        h)
+            show_help
+            exit 0
+            ;;
+        \?)
+            echo "Error: Invalid option -$OPTARG" >&2
+            echo "Use -h for help." >&2
+            exit 1
+            ;;
+        :)
+            echo "Error: Option -$OPTARG requires an argument." >&2
+            echo "Use -h for help." >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$input_file" ]]; then
+    echo "Error: input file is required." >&2
+    echo "Use -h for help." >&2
+    exit 1
+fi
+
+if [[ ! -f "$input_file" ]]; then
+    echo "Error: file '$input_file' does not exist." >&2
+    exit 1
+fi
+
+if [[ ! "$min_attempts" =~ ^[0-9]+$ ]]; then
+    echo "Error: -n must be a positive integer." >&2
+    exit 1
+fi
+
+if [[ ! "$mode" =~ ^(summary|detailed)$ ]]; then
+    echo "Error: mode must be 'summary' or 'detailed'." >&2
+    exit 1
+fi
+
+tmp_matches=$(mktemp)
+tmp_ips=$(mktemp)
+
+while IFS= read -r line; do
+    # optional username filter
+    if [[ -n "$username_filter" ]]; then
+        if [[ ! "$line" =~ $username_filter ]]; then
+            continue
+        fi
+    fi
+
+    matched=0
+
+    # built-in suspicious patterns
+    if [[ "$line" =~ Failed\ password ]] || [[ "$line" =~ Invalid\ user ]]; then
+        matched=1
+    fi
+
+    # custom regex pattern
+    if [[ -n "$custom_pattern" && "$line" =~ $custom_pattern ]]; then
+        matched=1
+    fi
+
+    if [[ "$matched" -eq 1 ]]; then
+        echo "$line" >> "$tmp_matches"
+
+        # extract IPv4 addresses with regex
+        if [[ "$line" =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]]; then
+            ip=$(echo "$line" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+            echo "$ip" >> "$tmp_ips"
+        fi
+    fi
+done < "$input_file"
+
+generate_output() {
+    if [[ "$mode" == "detailed" ]]; then
+        echo "SUSPICIOUS LOGIN REPORT"
+        echo "======================="
+        echo "Input file: $input_file"
+        [[ -n "$username_filter" ]] && echo "Username filter: $username_filter"
+        [[ -n "$custom_pattern" ]] && echo "Custom regex: $custom_pattern"
+        echo "Minimum repeated IP attempts to flag: $min_attempts"
+        echo
+
+        if [[ ! -s "$tmp_matches" ]]; then
+            echo "No suspicious entries found."
+            return
+        fi
+
+        echo "Matching log entries:"
+        echo "---------------------"
+        cat "$tmp_matches"
+        echo
+
+        echo "Repeated IPs:"
+        echo "-------------"
+        if [[ -s "$tmp_ips" ]]; then
+            sort "$tmp_ips" | uniq -c | awk -v n="$min_attempts" '$1 >= n {print "IP:", $2, "| Attempts:", $1}'
+        else
+            echo "No IP addresses found in suspicious lines."
+        fi
+
+    else
+        total_matches=0
+        repeated_ips=0
+
+        if [[ -s "$tmp_matches" ]]; then
+            total_matches=$(wc -l < "$tmp_matches")
+        fi
+
+        if [[ -s "$tmp_ips" ]]; then
+            repeated_ips=$(sort "$tmp_ips" | uniq -c | awk -v n="$min_attempts" '$1 >= n' | wc -l)
+        fi
+
+        echo "SUSPICIOUS LOGIN SUMMARY"
+        echo "========================"
+        echo "Input file: $input_file"
+        echo "Suspicious matching lines: $total_matches"
+        echo "Repeated suspicious IPs: $repeated_ips"
+    fi
+}
+
+if [[ -n "$output_file" ]]; then
+    generate_output > "$output_file"
+    echo "Report saved to $output_file"
+else
+    generate_output
+fi
+
+rm -f "$tmp_matches" "$tmp_ips"
